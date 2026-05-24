@@ -1,0 +1,9 @@
+.env
+secrets.env
+data/raw/
+data/features/
+models/registry/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.log
