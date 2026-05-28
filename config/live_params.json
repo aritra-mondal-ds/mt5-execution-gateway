@@ -1,0 +1,33 @@
+{
+  "_comment": "Live strategy parameters. Modified by auto_optimizer.py. Do not edit manually while bot is running.",
+  "_version": 1,
+  "_last_updated": "initial",
+  "_updated_by": "manual",
+
+  "trend": {
+    "fast_period": 9,
+    "slow_period": 21,
+    "adx_threshold": 20.0,
+    "exit_adx_threshold": 15.0,
+    "atr_multiplier": 1.5,
+    "tp_multiplier": 3.0,
+    "cooldown_bars": 2
+  },
+
+  "mean_reversion": {
+    "bb_period": 20,
+    "rsi_period": 14,
+    "oversold_rsi": 35.0,
+    "overbought_rsi": 65.0,
+    "adx_ceiling": 25.0,
+    "atr_multiplier": 2.0,
+    "max_bars_in_trade": 24,
+    "min_band_width": 0.001
+  },
+
+  "risk": {
+    "max_risk_per_trade": 0.01,
+    "max_positions": 8,
+    "min_edge_cost_ratio": 1.2
+  }
+}

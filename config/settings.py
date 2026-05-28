@@ -103,7 +103,7 @@ class LogConfig(BaseModel):
     level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
     log_dir: Path = PROJECT_ROOT / "logs"
     rotation: str = "1 day"
-    retention: str = "30 days"
+    retention: str = "365 days"
 
     @field_validator("log_dir", mode="before")
     @classmethod
