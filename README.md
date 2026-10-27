@@ -8,7 +8,7 @@
 
 ## Architecture & Subsystems
 
-This gateway functions as the **production live/paper execution layer**, fully decoupled from the offline research platform (`qresearch-engine`).
+This gateway functions as the **production live/paper execution layer**, fully decoupled from the offline research platform (`alpha-research-platform`).
 
 ```mermaid
 flowchart TD

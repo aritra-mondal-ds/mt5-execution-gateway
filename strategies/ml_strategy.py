@@ -99,7 +99,10 @@ class MLStrategy(BaseStrategy):
     ) -> None:
         """Locates and loads model weights and feature metadata."""
         root = Path(__file__).resolve().parents[1]
-        sibling_research_root = root.parent / "TradingBot" / "crypto" / "models"
+        sibling_roots = [
+            root.parent / "alpha-research-platform" / "crypto" / "models",
+            root.parent / "TradingBot" / "crypto" / "models",
+        ]
 
         candidates = []
         if model_path:
@@ -109,18 +112,24 @@ class MLStrategy(BaseStrategy):
         candidates.extend([
             root / "models" / "registry" / "lightgbm" / "model.txt",
             root / "models" / "lightgbm" / "model.txt",
-            sibling_research_root / "lightgbm" / "model.txt",
         ])
+        for sroot in sibling_roots:
+            candidates.append(sroot / "lightgbm" / "model.txt")
 
         # Check local and sibling XGBoost models (prefer v2 anti-overfitting)
         candidates.extend([
             root / "models" / "registry" / "xgboost_v2" / "model.json",
             root / "models" / "xgboost_v2" / "model.json",
-            sibling_research_root / "xgboost_v2" / "model.json",
+        ])
+        for sroot in sibling_roots:
+            candidates.append(sroot / "xgboost_v2" / "model.json")
+
+        candidates.extend([
             root / "models" / "registry" / "xgboost" / "model.json",
             root / "models" / "xgboost" / "model.json",
-            sibling_research_root / "xgboost" / "model.json",
         ])
+        for sroot in sibling_roots:
+            candidates.append(sroot / "xgboost" / "model.json")
 
         target_model = None
         for c in candidates:
