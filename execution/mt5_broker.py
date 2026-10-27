@@ -78,6 +78,8 @@ class MT5Broker(BrokerBase):
         magic_number: int = 234000,     # unique EA identifier
         deviation: int = 20,            # max slippage in points
         lot_step_overrides: dict[str, float] | None = None,
+        max_spread_points: float | None = 40.0,
+        max_spread_pct: float | None = 0.0010,
     ) -> None:
         super().__init__(broker_id="mt5")
         self._login = login
@@ -87,6 +89,8 @@ class MT5Broker(BrokerBase):
         self._magic = magic_number
         self._deviation = deviation
         self._lot_steps = lot_step_overrides or {}
+        self._max_spread_points = max_spread_points
+        self._max_spread_pct = max_spread_pct
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mt5_broker")
 
     # ------------------------------------------------------------------
@@ -224,6 +228,26 @@ class MT5Broker(BrokerBase):
             raise BrokerError(f"Cannot get tick for {order.symbol}")
 
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
+
+        # Spread & slippage guard: block entry orders if spread is blown out
+        if not order.is_exit:
+            spread = tick.ask - tick.bid
+            if price > 0:
+                spread_pct = spread / price
+                if self._max_spread_pct is not None and spread_pct > self._max_spread_pct:
+                    raise BrokerError(
+                        f"Spread filter rejected entry | {order.symbol} spread={spread_pct*10000:.1f} bps "
+                        f"(limit={self._max_spread_pct*10000:.1f} bps, ask={tick.ask}, bid={tick.bid})"
+                    )
+            if self._max_spread_points is not None:
+                sym_info = mt5.symbol_info(order.symbol)
+                if sym_info is not None and sym_info.point > 0:
+                    spread_pts = spread / sym_info.point
+                    if spread_pts > self._max_spread_points:
+                        raise BrokerError(
+                            f"Spread points rejected entry | {order.symbol} spread={spread_pts:.1f} pts "
+                            f"(limit={self._max_spread_points:.1f} pts)"
+                        )
 
         # Validate and round lot size to symbol's lot step
         lot_size = self._round_lots(order.symbol, order.lot_size)

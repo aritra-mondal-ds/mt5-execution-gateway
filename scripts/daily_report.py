@@ -1,19 +1,10 @@
 """
 scripts/daily_report.py
 ------------------------
-Generates a daily trading summary printed to console and saved to
-logs/daily_reports/YYYY-MM-DD.txt
+Daily trading summary: P&L, win rate, param history, signal diagnostics.
 
-Run manually or scheduled (e.g. via Windows Task Scheduler at 23:55 UTC):
+Run manually or via Windows Task Scheduler at 23:55 UTC:
     python scripts/daily_report.py
-
-Sections:
-  1. Account snapshot (equity, balance, open positions)
-  2. Today's closed trades (P&L, win rate, expectancy)
-  3. Running totals (cumulative since bot started)
-  4. Strategy parameter history (what auto_optimizer changed)
-  5. Signal diagnostics summary (why signals fired or didn't)
-  6. Recommendation for tomorrow
 """
 
 from __future__ import annotations
@@ -30,9 +21,9 @@ sys.path.insert(0, str(_ROOT))
 
 from loguru import logger
 
-PARAMS_FILE    = _ROOT / "config" / "live_params.json"
-DIAG_CSV       = _ROOT / "logs" / "signal_diagnostics.csv"
-REPORT_DIR     = _ROOT / "logs" / "daily_reports"
+PARAMS_FILE = _ROOT / "config" / "live_params.json"
+DIAG_CSV    = _ROOT / "logs" / "signal_diagnostics.csv"
+REPORT_DIR  = _ROOT / "logs" / "daily_reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -135,11 +126,12 @@ def _read_params() -> dict:
 
 
 def _read_signal_diagnostics_today() -> dict:
-    """Summarise today's signal_diagnostics.csv."""
     if not DIAG_CSV.exists():
         return {}
     today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-    counts: dict[str, dict] = defaultdict(lambda: {"total": 0, "signals": 0, "reasons": defaultdict(int)})
+    counts: dict[str, dict] = defaultdict(
+        lambda: {"total": 0, "signals": 0, "reasons": defaultdict(int)}
+    )
     try:
         with open(DIAG_CSV, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
@@ -150,8 +142,7 @@ def _read_signal_diagnostics_today() -> dict:
                 counts[strat]["total"] += 1
                 if row.get("signal", "None") != "None":
                     counts[strat]["signals"] += 1
-                diag = row.get("diagnosis", "")
-                # Extract the first word as reason category
+                diag   = row.get("diagnosis", "")
                 reason = diag.split(":")[0].strip() if ":" in diag else diag[:20]
                 counts[strat]["reasons"][reason] += 1
     except Exception:
@@ -164,9 +155,9 @@ def _read_signal_diagnostics_today() -> dict:
 # ---------------------------------------------------------------------------
 
 def build_report() -> str:
-    now    = datetime.now(tz=timezone.utc)
-    lines  = []
-    bar    = "═" * 60
+    now   = datetime.now(tz=timezone.utc)
+    lines: list[str] = []
+    bar   = "=" * 60
 
     lines.append(bar)
     lines.append(f"  DAILY TRADING REPORT  —  {now.strftime('%Y-%m-%d %H:%M UTC')}")
@@ -174,36 +165,35 @@ def build_report() -> str:
 
     # ── 1. Account snapshot ───────────────────────────────────────────
     snap = _get_account_snapshot()
-    lines.append("\n📊 ACCOUNT")
+    lines.append("\n[ACCOUNT]")
     if snap and "error" not in snap:
         lines.append(f"  Equity   : ${snap['equity']:>12,.2f}")
         lines.append(f"  Balance  : ${snap['balance']:>12,.2f}")
         lines.append(f"  Open P&L : ${snap['profit']:>+12,.2f}")
         lines.append(f"  Open pos : {snap['n_open']}  {snap['open_syms']}")
     else:
-        lines.append("  MT5 not connected — restart bot to get live data")
+        lines.append("  MT5 not connected — run from trading terminal")
 
     # ── 2. Today's trades ─────────────────────────────────────────────
     today_trades = _get_todays_trades()
-    lines.append("\n📈 TODAY'S TRADES")
+    lines.append("\n[TODAY'S TRADES]")
     if today_trades:
-        wins   = [t for t in today_trades if t["win"]]
-        losses = [t for t in today_trades if not t["win"]]
+        wins      = [t for t in today_trades if t["win"]]
+        losses    = [t for t in today_trades if not t["win"]]
         total_pnl = sum(t["net_pnl"] for t in today_trades)
         win_rate  = len(wins) / len(today_trades)
 
-        lines.append(f"  Trades   : {len(today_trades)}  "
-                     f"(wins={len(wins)}, losses={len(losses)})")
+        lines.append(f"  Trades   : {len(today_trades)}  (wins={len(wins)}, losses={len(losses)})")
         lines.append(f"  Win rate : {win_rate:.0%}")
         lines.append(f"  Total P&L: ${total_pnl:>+,.2f}")
         lines.append(f"  Avg P&L  : ${total_pnl/len(today_trades):>+,.2f}")
         lines.append("")
         for t in today_trades:
-            emoji = "✅" if t["win"] else "❌"
+            emoji = "WIN " if t["win"] else "LOSS"
             lines.append(
-                f"  {emoji} {t['symbol']:8} {t['direction']:5} "
+                f"  [{emoji}] {t['symbol']:8} {t['direction']:5} "
                 f"{t['lots']:.2f}L  "
-                f"open={t['open']:.4f} → {t['close']:.4f}  "
+                f"{t['open']:.4f} -> {t['close']:.4f}  "
                 f"P&L={t['net_pnl']:>+8.2f}  hold={t['hold_h']:.1f}h"
             )
     else:
@@ -211,18 +201,21 @@ def build_report() -> str:
 
     # ── 3. Running totals ─────────────────────────────────────────────
     all_trades = _get_all_time_trades(days=60)
-    lines.append("\n📉 RUNNING TOTALS (60 days)")
+    lines.append("\n[RUNNING TOTALS — 60 days]")
     if all_trades:
-        pnls  = [t["net_pnl"] for t in all_trades]
-        wins  = [p for p in pnls if p > 0]
-        gl    = abs(sum(p for p in pnls if p < 0))
-        gp    = sum(wins)
+        pnls = [t["net_pnl"] for t in all_trades]
+        wins = [p for p in pnls if p > 0]
+        gl   = abs(sum(p for p in pnls if p < 0))
+        gp   = sum(wins)
         lines.append(f"  Total trades : {len(pnls)}")
         lines.append(f"  Win rate     : {len(wins)/len(pnls):.0%}")
         lines.append(f"  Net P&L      : ${sum(pnls):>+,.2f}")
-        lines.append(f"  Profit factor: {gp/gl:.2f}" if gl > 0 else "  Profit factor: ∞ (no losses)")
+        if gl > 0:
+            lines.append(f"  Profit factor: {gp/gl:.2f}")
+        else:
+            lines.append("  Profit factor: inf (no losses yet)")
         lines.append(f"  Expectancy   : ${sum(pnls)/len(pnls):>+,.2f} per trade")
-        # By symbol
+
         by_sym: dict[str, list] = defaultdict(list)
         for t in all_trades:
             by_sym[t["symbol"]].append(t["net_pnl"])
@@ -238,55 +231,68 @@ def build_report() -> str:
 
     # ── 4. Strategy params ────────────────────────────────────────────
     params = _read_params()
-    lines.append("\n⚙️  LIVE STRATEGY PARAMS")
+    lines.append("\n[LIVE STRATEGY PARAMS]")
     if params:
         lines.append(f"  Version      : v{params.get('_version', '?')}")
         lines.append(f"  Last updated : {params.get('_last_updated', 'never')}")
         lines.append(f"  Updated by   : {params.get('_updated_by', 'manual')}")
-        t = params.get("trend", {})
+        t  = params.get("trend", {})
         mr = params.get("mean_reversion", {})
-        lines.append(f"  Trend        : adx>{t.get('adx_threshold')} "
-                     f"ema{t.get('fast_period')}/{t.get('slow_period')} "
-                     f"sl={t.get('atr_multiplier')}×ATR "
-                     f"tp={t.get('tp_multiplier')}×ATR")
-        lines.append(f"  MeanRev      : rsi<{mr.get('oversold_rsi')}/>{">"}{mr.get('overbought_rsi')} "
-                     f"adx_ceil={mr.get('adx_ceiling')} "
-                     f"max_hold={mr.get('max_bars_in_trade')}bars")
+        # Build strings first to avoid f-string expression conflicts
+        adx_t    = t.get("adx_threshold", "?")
+        fast     = t.get("fast_period", "?")
+        slow     = t.get("slow_period", "?")
+        atr_m    = t.get("atr_multiplier", "?")
+        tp_m     = t.get("tp_multiplier", "?")
+        os_rsi   = mr.get("oversold_rsi", "?")
+        ob_rsi   = mr.get("overbought_rsi", "?")
+        adx_c    = mr.get("adx_ceiling", "?")
+        max_b    = mr.get("max_bars_in_trade", "?")
+        lines.append(
+            f"  Trend   : adx>{adx_t} ema{fast}/{slow} "
+            f"sl={atr_m}xATR tp={tp_m}xATR"
+        )
+        lines.append(
+            f"  MeanRev : rsi_os={os_rsi} rsi_ob={ob_rsi} "
+            f"adx_ceil={adx_c} max_hold={max_b}bars"
+        )
 
     # ── 5. Signal diagnostics ─────────────────────────────────────────
     diag = _read_signal_diagnostics_today()
-    lines.append("\n🔍 SIGNAL DIAGNOSTICS TODAY")
+    lines.append("\n[SIGNAL DIAGNOSTICS TODAY]")
     if diag:
         for strat, stats in diag.items():
-            signal_rate = stats["signals"] / stats["total"] if stats["total"] > 0 else 0
+            signal_rate = (
+                stats["signals"] / stats["total"] if stats["total"] > 0 else 0
+            )
             lines.append(
-                f"  {strat}: {stats['total']} evals → "
+                f"  {strat}: {stats['total']} evals -> "
                 f"{stats['signals']} signals ({signal_rate:.0%})"
             )
             top_reasons = sorted(
                 stats["reasons"].items(), key=lambda x: x[1], reverse=True
             )[:3]
             for reason, count in top_reasons:
-                lines.append(f"    └ {reason}: {count}×")
+                lines.append(f"    -> {reason}: {count}x")
     else:
-        lines.append("  No diagnostic data yet (needs LOG_LEVEL=DEBUG or H1/H4 bars)")
+        lines.append("  No diagnostic data (set LOG_LEVEL=DEBUG or wait for H1/M15 bars)")
 
     # ── 6. Recommendation ─────────────────────────────────────────────
-    lines.append("\n💡 RECOMMENDATION FOR TOMORROW")
+    lines.append("\n[RECOMMENDATION FOR TOMORROW]")
     if all_trades and len(all_trades) >= 10:
         pnls = [t["net_pnl"] for t in all_trades]
         wr   = sum(1 for p in pnls if p > 0) / len(pnls)
         exp  = sum(pnls) / len(pnls)
         if exp > 20 and wr > 0.60:
-            lines.append("  ✅ System performing well. No changes needed.")
+            lines.append("  System performing well. No changes needed.")
         elif exp > 0 and wr > 0.50:
-            lines.append("  ⚡ Positive but room to improve. Run auto_optimizer.py.")
-        elif len(all_trades) < 20:
-            lines.append("  ⏳ Not enough trades for statistical significance. Keep running.")
+            lines.append("  Positive but room to improve. Run: python scripts/auto_optimizer.py")
         else:
-            lines.append("  ⚠️  Below target. Run: python scripts/auto_optimizer.py --force")
+            lines.append("  Below target. Run: python scripts/auto_optimizer.py --force")
     else:
-        lines.append("  ⏳ Accumulating trade data. System needs 10+ trades for assessment.")
+        lines.append(
+            "  Accumulating trade data. System needs 10+ trades for assessment."
+        )
 
     lines.append(f"\n{bar}\n")
     return "\n".join(lines)

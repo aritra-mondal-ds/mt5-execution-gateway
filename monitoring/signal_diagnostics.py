@@ -196,8 +196,10 @@ class SignalDiagnostics:
         ema9_str = f"{ema9:.4f}" if ema9 is not None else "N/A"
         ema21_str= f"{ema21:.4f}"if ema21 is not None else "N/A"
 
-        # Log to console at DEBUG (or INFO if signal fired)
-        log_fn = logger.info if signal else logger.debug
+        # Log at INFO always for M15/H1 — visible in default log level
+        # M1/M5 stay at DEBUG to avoid noise
+        high_tf = timeframe in ("M15", "H1", "H4")
+        log_fn = logger.info if (signal or high_tf) else logger.debug
         log_fn(
             f"DIAG | {strategy_id} | {symbol}/{timeframe} | {bar_time} | "
             f"close={close:.4f} rsi={rsi_str} adx={adx_str} "

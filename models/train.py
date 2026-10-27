@@ -330,11 +330,20 @@ class ModelTrainer:
         early_stopping = p.pop("early_stopping_rounds", 50)
         p.pop("verbosity", None)
 
-        dtrain = lgb.Dataset(X_train, label=y_train)
+        dtrain = lgb.Dataset(
+            np.ascontiguousarray(X_train, dtype=np.float32),
+            label=np.ascontiguousarray(y_train, dtype=np.float32),
+            free_raw_data=False,
+        )
         callbacks = [lgb.log_evaluation(period=100)]
 
         if X_val is not None and not final:
-            dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
+            dval = lgb.Dataset(
+                np.ascontiguousarray(X_val, dtype=np.float32),
+                label=np.ascontiguousarray(y_val, dtype=np.float32),
+                reference=dtrain,
+                free_raw_data=False,
+            )
             callbacks.append(lgb.early_stopping(early_stopping, verbose=False))
             model = lgb.train(
                 p, dtrain,

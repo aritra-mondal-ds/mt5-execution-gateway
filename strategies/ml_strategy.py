@@ -1,38 +1,27 @@
 """
 strategies/ml_strategy.py
---------------------------
-LightGBM-based ML strategy.
+-------------------------
+Production Machine Learning Strategy Bridge.
 
-Architecture:
-  - Wraps a trained LightGBM binary classifier.
-  - Model predicts P(next_N_bars_return > threshold) for long,
-    and P(next_N_bars_return < -threshold) for short.
-  - Signals are emitted when class probability exceeds entry_threshold.
-  - Model is loaded from the model registry (versioned .pkl files).
-  - Feature columns used for inference are stored alongside the model
-    to guarantee consistency between training and live inference.
+Consumes serialized model artifacts (LightGBM booster or XGBoost classifier)
+trained offline in the research platform (TraderBot).
 
-Lookahead safety:
-  - The model is trained on features from bar t to predict bar t+N.
-  - At inference time, we feed features from the LATEST completed bar.
-  - The `feature_cols` list stored with the model is the contract —
-    we assert the incoming row contains exactly those columns.
-
-GPU inference:
-  - LightGBM uses the GPU automatically if the model was trained
-    with device='gpu'. No code change needed here.
-
-Model registry interface:
-  - Load: ModelRegistry.load(model_id) → (model, metadata)
-  - metadata contains: feature_cols, training_date, performance_metrics
+Execution Lifecycle:
+  1. Loads model weights (model.txt or model.json) and metadata (meta.json).
+  2. Receives live feature dictionary from the FeaturePipeline on each bar.
+  3. Validates required stationary feature alignment.
+  4. Runs sub-millisecond inference to compute class probabilities:
+     P(SHORT), P(HOLD), P(LONG).
+  5. Emits a typed Signal with confidence strength if max(P(LONG), P(SHORT)) >= threshold.
+  6. Calculates ATR-derived dynamic Stop Loss and Take Profit levels for the RiskEngine.
 """
 
 from __future__ import annotations
 
-import pickle
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
 import numpy as np
 from loguru import logger
 
@@ -41,258 +30,303 @@ from strategies.base_strategy import BaseStrategy, Direction, Signal
 
 class MLStrategy(BaseStrategy):
     """
-    LightGBM signal strategy.
+    Quantitative Machine Learning Strategy.
 
-    Can be instantiated either with a model object directly (for testing)
-    or with a path to a pickled model file (for production).
-
-    Required feature columns: stored in model metadata or passed explicitly.
+    Evaluates live feature vectors against an offline-trained gradient boosted
+    decision tree (LightGBM / XGBoost).
     """
 
     def __init__(
         self,
         symbol: str,
         timeframe: str,
-        model_path: str | Path | None = None,
-        model: Any = None,                    # pre-loaded model (for testing)
+        model: Any = None,
         feature_cols: list[str] | None = None,
-        long_threshold: float = 0.60,         # P(long) must exceed this
-        short_threshold: float = 0.60,        # P(short) must exceed this
-        exit_threshold: float = 0.45,         # exit when confidence drops below
-        atr_period: int = 14,
+        model_path: str | Path | None = None,
+        meta_path: str | Path | None = None,
+        confidence_threshold: float = 0.55,
+        long_threshold: float | None = None,
+        short_threshold: float | None = None,
+        exit_threshold: float = 0.40,
+        max_bars_in_trade: int | None = None,
         atr_multiplier: float = 1.5,
-        tp_multiplier: float = 3.0,
-        max_bars_in_trade: int = 30,
-        cooldown_bars: int = 2,
+        tp_multiplier: float = 2.5,
+        cooldown_bars: int = 1,
+        warmup_bars: int = 100,
+        strategy_id: str | None = None,
+        **kwargs: Any,
     ) -> None:
+        sid = strategy_id or f"ml_{symbol.lower()}_{timeframe.lower()}"
         super().__init__(
-            strategy_id=f"ml_lgbm_{symbol}_{timeframe}",
+            strategy_id=sid,
             symbol=symbol,
             timeframe=timeframe,
-            warmup_bars=200,
+            warmup_bars=warmup_bars,
         )
-        self._model = model
-        self._feature_cols: list[str] = feature_cols or []
-        self._atr_col = f"atr_{atr_period}"
-        self.long_threshold = long_threshold
-        self.short_threshold = short_threshold
+        self.long_threshold = long_threshold if long_threshold is not None else confidence_threshold
+        self.short_threshold = short_threshold if short_threshold is not None else confidence_threshold
+        self.confidence_threshold = confidence_threshold
         self.exit_threshold = exit_threshold
+        self.max_bars_in_trade = max_bars_in_trade
         self.atr_multiplier = atr_multiplier
         self.tp_multiplier = tp_multiplier
-        self.max_bars_in_trade = max_bars_in_trade
         self.cooldown_bars = cooldown_bars
-        self._cooldown_counter = 0
+
+        self._cooldown_counter: int = 0
         self._last_proba: tuple[float, float] | None = None  # (p_long, p_short)
+        self._model: Any = model
+        self._feature_cols: list[str] = list(feature_cols) if feature_cols is not None else []
+        self._model_type: str = "custom" if model is not None else "none"
 
-        if model_path is not None:
-            self._load_model(Path(model_path))
-
-    # ------------------------------------------------------------------
-    # Model loading
-    # ------------------------------------------------------------------
-
-    def _load_model(self, path: Path) -> None:
-        """
-        Load model and metadata from a pickle file.
-
-        Expected pickle format:
-            {
-                "model": lgb.Booster,
-                "feature_cols": [...],
-                "metadata": {...}
-            }
-        Or simply a raw lgb.Booster (feature_cols must be passed explicitly).
-        """
-        if not path.exists():
-            raise FileNotFoundError(f"Model not found: {path}")
-
-        with open(path, "rb") as f:
-            obj = pickle.load(f)
-
-        if isinstance(obj, dict):
-            self._model = obj["model"]
-            if not self._feature_cols:
-                self._feature_cols = obj.get("feature_cols", [])
-            metadata = obj.get("metadata", {})
-            logger.info(
-                f"MLStrategy loaded model from {path} | "
-                f"features={len(self._feature_cols)} | "
-                f"trained={metadata.get('training_date', 'unknown')}"
-            )
-        else:
-            # Raw model object
-            self._model = obj
-            logger.info(f"MLStrategy loaded raw model from {path}")
+        # Attempt to load model and metadata from disk if not directly supplied
+        if self._model is None and feature_cols is None:
+            self._resolve_and_load_model(model_path, meta_path)
+        elif model_path is not None:
+            self._resolve_and_load_model(model_path, meta_path)
 
     @property
     def is_ready(self) -> bool:
-        """True if model is loaded and feature columns are defined."""
-        return self._model is not None and len(self._feature_cols) > 0
+        return self._model is not None and bool(self._feature_cols)
 
     # ------------------------------------------------------------------
-    # Core logic
+    # Model Loading & Resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_and_load_model(
+        self,
+        model_path: str | Path | None,
+        meta_path: str | Path | None,
+    ) -> None:
+        """Locates and loads model weights and feature metadata."""
+        root = Path(__file__).resolve().parents[1]
+        sibling_research_root = root.parent / "TradingBot" / "crypto" / "models"
+
+        candidates = []
+        if model_path:
+            candidates.append(Path(model_path))
+
+        # Check local and sibling LightGBM models
+        candidates.extend([
+            root / "models" / "registry" / "lightgbm" / "model.txt",
+            root / "models" / "lightgbm" / "model.txt",
+            sibling_research_root / "lightgbm" / "model.txt",
+        ])
+
+        # Check local and sibling XGBoost models (prefer v2 anti-overfitting)
+        candidates.extend([
+            root / "models" / "registry" / "xgboost_v2" / "model.json",
+            root / "models" / "xgboost_v2" / "model.json",
+            sibling_research_root / "xgboost_v2" / "model.json",
+            root / "models" / "registry" / "xgboost" / "model.json",
+            root / "models" / "xgboost" / "model.json",
+            sibling_research_root / "xgboost" / "model.json",
+        ])
+
+        target_model = None
+        for c in candidates:
+            if c.exists():
+                target_model = c
+                break
+
+        if target_model is None:
+            logger.warning(
+                f"[{self.strategy_id}] No serialized ML model found at search paths. "
+                f"Strategy will operate in passive observation mode."
+            )
+            return
+
+        # Resolve metadata
+        target_meta = Path(meta_path) if meta_path else target_model.parent / "meta.json"
+        if not target_meta.exists():
+            pkl_meta = target_model.parent / "meta.pkl"
+            if pkl_meta.exists():
+                import pickle
+                with open(pkl_meta, "rb") as f:
+                    meta = pickle.load(f)
+                if not self._feature_cols:
+                    self._feature_cols = meta.get("feature_cols", [])
+                self.confidence_threshold = meta.get("threshold", self.confidence_threshold)
+            else:
+                logger.warning(f"[{self.strategy_id}] Metadata not found at {target_meta}")
+        else:
+            try:
+                meta = json.loads(target_meta.read_text())
+                if not self._feature_cols:
+                    self._feature_cols = meta.get("feature_cols", [])
+                self.confidence_threshold = meta.get("threshold", self.confidence_threshold)
+            except Exception as e:
+                logger.error(f"[{self.strategy_id}] Error reading metadata: {e}")
+
+        # Load weights
+        try:
+            if target_model.suffix in (".txt", ""):
+                import lightgbm as lgb
+                self._model = lgb.Booster(model_file=str(target_model))
+                self._model_type = "lightgbm"
+                logger.info(
+                    f"[{self.strategy_id}] LightGBM model loaded ← {target_model.name} "
+                    f"({len(self._feature_cols)} features, threshold={self.confidence_threshold:.2f})"
+                )
+            elif target_model.suffix == ".json":
+                import xgboost as xgb
+                self._model = xgb.XGBClassifier()
+                self._model.load_model(str(target_model))
+                self._model_type = "xgboost"
+                logger.info(
+                    f"[{self.strategy_id}] XGBoost model loaded ← {target_model.name} "
+                    f"({len(self._feature_cols)} features, threshold={self.confidence_threshold:.2f})"
+                )
+        except Exception as e:
+            logger.error(f"[{self.strategy_id}] Failed to load model from {target_model}: {e}")
+            self._model = None
+
+    # ------------------------------------------------------------------
+    # Core Signal Generation
     # ------------------------------------------------------------------
 
     def on_bar(self, row: dict) -> Signal | None:
         if not self.is_ready:
-            logger.warning(f"{self.strategy_id}: model not loaded — no signal")
             return None
 
-        # --- Exit logic ---
-        if not self.is_flat:
-            signal = self._check_exit(row)
-            if signal is not None:
-                self._state.current_position = Direction.FLAT
-                self._state.bars_in_trade = 0
-                self._cooldown_counter = self.cooldown_bars
-                return signal
-            self._state.bars_in_trade += 1
+        # Check in-trade position management first
+        in_position = self._state.current_position != Direction.FLAT
+        if in_position:
+            # Check maximum holding period
+            if (
+                self.max_bars_in_trade is not None
+                and self._state.bars_in_trade >= self.max_bars_in_trade
+            ):
+                return self._create_exit_signal(row, "max_holding_period")
 
-        # --- Cooldown ---
-        if self._cooldown_counter > 0:
+        # Check cooldown counter for new entries
+        if not in_position and self._cooldown_counter > 0:
             self._cooldown_counter -= 1
             return None
 
-        # --- Entry logic ---
-        if self.is_flat:
-            signal = self._check_entry(row)
-            if signal is not None:
-                self._state.current_position = signal.direction
-                self._state.bars_in_trade = 0
-            return signal
+        # Extract features
+        missing_feature = any(
+            col not in row or row[col] is None or (isinstance(row[col], float) and np.isnan(row[col]))
+            for col in self._feature_cols
+        )
 
-        return None
+        if missing_feature:
+            if self._last_proba is None:
+                return None
+            p_long, p_short = self._last_proba
+            p_hold = max(0.0, 1.0 - (p_long + p_short))
+        else:
+            x = np.array([[float(row[c]) for c in self._feature_cols]], dtype=np.float32)
+            try:
+                if hasattr(self._model, "predict_proba"):
+                    proba = self._model.predict_proba(x)[0]
+                elif hasattr(self._model, "predict"):
+                    res = self._model.predict(x)
+                    proba = res[0] if (
+                        (hasattr(res, "ndim") and res.ndim > 1)
+                        or (isinstance(res, (list, tuple)) and isinstance(res[0], (list, tuple, np.ndarray)))
+                    ) else res
+                else:
+                    return None
+            except Exception as e:
+                logger.debug(f"[{self.strategy_id}] Inference error: {e}")
+                return None
 
-    def _predict(self, row: dict) -> tuple[float, float]:
-        """
-        Run model inference on a single feature row.
-
-        Returns: (p_long, p_short)
-          - p_long  = P(price goes up significantly)
-          - p_short = P(price goes down significantly)
-
-        For a 3-class model: [down, flat, up]
-          p_long  = proba[2]
-          p_short = proba[0]
-
-        For a binary model trained on up/down:
-          p_long  = proba[1]
-          p_short = 1 - proba[1]
-        """
-        missing = [c for c in self._feature_cols if c not in row]
-        if missing:
-            logger.warning(
-                f"{self.strategy_id}: missing {len(missing)} feature cols "
-                f"(first 3: {missing[:3]}) — using last known proba"
-            )
-            return self._last_proba or (0.5, 0.5)
-
-        # Build feature vector — must match training column order exactly
-        X = np.array([[row[c] if row[c] is not None else 0.0
-                        for c in self._feature_cols]], dtype=np.float32)
-
-        try:
-            proba = self._model.predict(X)
-
-            # Handle both binary and multiclass output shapes
-            if proba.ndim == 1:
-                # Binary: proba is shape (1,) → probability of class 1
-                p_long = float(proba[0])
-                p_short = 1.0 - p_long
-            elif proba.shape[1] == 2:
-                # Binary sklearn-style: shape (1, 2)
-                p_long = float(proba[0, 1])
-                p_short = float(proba[0, 0])
-            elif proba.shape[1] == 3:
-                # 3-class: [down, flat, up]
-                p_short = float(proba[0, 0])
-                p_long  = float(proba[0, 2])
+            if len(proba) == 3:
+                p_short = float(proba[0])
+                p_hold  = float(proba[1])
+                p_long  = float(proba[2])
+            elif len(proba) == 2:
+                p_short = float(proba[0])
+                p_hold  = 0.0
+                p_long  = float(proba[1])
             else:
-                p_long, p_short = 0.5, 0.5
+                p_short, p_hold, p_long = 0.0, 1.0, 0.0
 
-        except Exception as e:
-            logger.error(f"{self.strategy_id}: inference error: {e}")
-            return self._last_proba or (0.5, 0.5)
+            self._last_proba = (p_long, p_short)
 
-        self._last_proba = (p_long, p_short)
-        return p_long, p_short
-
-    def _check_entry(self, row: dict) -> Signal | None:
-        p_long, p_short = self._predict(row)
-        close = self._get(row, "close")
-
-        if close is None:
+        # Check confidence degradation for existing positions
+        if in_position:
+            if (
+                self._state.current_position == Direction.LONG
+                and p_long < self.exit_threshold
+            ) or (
+                self._state.current_position == Direction.SHORT
+                and p_short < self.exit_threshold
+            ):
+                return self._create_exit_signal(row, "confidence_dropped")
             return None
 
-        # ATR is for sizing only — missing ATR means SL/TP are None.
-        # The risk engine will apply its own sizing in that case.
-        atr = self._get(row, self._atr_col)
-        sl_long = sl_short = tp_long = tp_short = None
-        if atr is not None:
-            stop   = atr * self.atr_multiplier
-            tp_dist = atr * self.tp_multiplier
-            sl_long  = close - stop
-            sl_short = close + stop
-            tp_long  = close + tp_dist
-            tp_short = close - tp_dist
+        # New entry decision logic
+        direction: Direction | None = None
+        strength: float = 0.0
 
-        if p_long >= self.long_threshold:
-            logger.debug(
-                f"{self.strategy_id} LONG | {row['event_time']} | "
-                f"p_long={p_long:.3f} close={close:.4f}"
-            )
-            return self._make_signal(
-                row, Direction.LONG,
-                strength=p_long,
-                stop_loss=sl_long,
-                take_profit=tp_long,
-                meta={"p_long": p_long, "p_short": p_short},
-            )
+        if p_long >= self.long_threshold and p_long > p_short:
+            direction = Direction.LONG
+            strength = p_long
+        elif p_short >= self.short_threshold and p_short > p_long:
+            direction = Direction.SHORT
+            strength = p_short
 
-        if p_short >= self.short_threshold:
-            logger.debug(
-                f"{self.strategy_id} SHORT | {row['event_time']} | "
-                f"p_short={p_short:.3f} close={close:.4f}"
-            )
-            return self._make_signal(
-                row, Direction.SHORT,
-                strength=p_short,
-                stop_loss=sl_short,
-                take_profit=tp_short,
-                meta={"p_long": p_long, "p_short": p_short},
-            )
+        if direction is None:
+            return None
 
-        return None
+        close = float(row.get("close", 0.0))
+        atr = float(row.get("atr_14", 0.0))
 
-    def _check_exit(self, row: dict) -> Signal | None:
-        p_long, p_short = self._predict(row)
-        exit_reason = None
+        bar_time = row.get("event_time")
+        if bar_time is None:
+            bar_time = datetime.now(tz=timezone.utc)
+        elif bar_time.tzinfo is None:
+            bar_time = bar_time.replace(tzinfo=timezone.utc)
 
-        if self._state.bars_in_trade >= self.max_bars_in_trade:
-            exit_reason = "max_holding_period"
-        elif self.is_long and p_long < self.exit_threshold:
-            exit_reason = "confidence_dropped"
-        elif self.is_short and p_short < self.exit_threshold:
-            exit_reason = "confidence_dropped"
+        stop_dist = self.atr_multiplier * atr if atr > 0 else (close * 0.015 if close > 0 else 1.0)
+        tp_dist = self.tp_multiplier * atr if atr > 0 else (close * 0.025 if close > 0 else 2.0)
 
-        if exit_reason:
-            return self._make_signal(
-                row, Direction.FLAT,
-                meta={
-                    "exit_reason": exit_reason,
-                    "p_long": p_long, "p_short": p_short,
-                    "bars_held": self._state.bars_in_trade,
-                },
-            )
-        return None
+        if direction == Direction.LONG:
+            sl = close - stop_dist if close > 0 else None
+            tp = close + tp_dist if close > 0 else None
+        else:
+            sl = close + stop_dist if close > 0 else None
+            tp = close - tp_dist if close > 0 else None
 
-    # ------------------------------------------------------------------
-    # Reset
-    # ------------------------------------------------------------------
+        self._cooldown_counter = self.cooldown_bars
+
+        return Signal(
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            direction=direction,
+            strength=strength,
+            strategy_id=self.strategy_id,
+            bar_time=bar_time,
+            stop_loss=round(sl, 5) if sl is not None else None,
+            take_profit=round(tp, 5) if tp is not None else None,
+            atr_at_signal=atr,
+            meta={
+                "p_short": round(p_short, 4),
+                "p_hold": round(p_hold, 4),
+                "p_long": round(p_long, 4),
+                "model_type": self._model_type,
+            },
+        )
+
+    def _create_exit_signal(self, row: dict, exit_reason: str) -> Signal:
+        bar_time = row.get("event_time")
+        if bar_time is None:
+            bar_time = datetime.now(tz=timezone.utc)
+        elif bar_time.tzinfo is None:
+            bar_time = bar_time.replace(tzinfo=timezone.utc)
+
+        return Signal(
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            direction=Direction.FLAT,
+            strength=1.0,
+            strategy_id=self.strategy_id,
+            bar_time=bar_time,
+            meta={"exit_reason": exit_reason},
+        )
 
     def reset(self) -> None:
-        from strategies.base_strategy import StrategyState
-        self._state = StrategyState(strategy_id=self.strategy_id)
-        self._bar_count = 0
-        self._last_proba = None
         self._cooldown_counter = 0
+        self._last_proba = None
+        self._bar_count = 0
